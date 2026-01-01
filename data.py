@@ -69,12 +69,15 @@ class TransformSamplingSubTraj:
         self.action_range = action_range
 
     def __call__(self, traj):
+        #print(traj)
         si = random.randint(0, traj["rewards"].shape[0] - 1)
 
         # get sequences from dataset
         ss = traj["observations"][si : si + self.max_len].reshape(-1, self.state_dim)
         aa = traj["actions"][si : si + self.max_len].reshape(-1, self.act_dim)
         rr = traj["rewards"][si : si + self.max_len].reshape(-1, 1)
+        rr_p = traj["reward_pred"][si : si + self.max_len].reshape(-1, 1)
+        
         if "terminals" in traj:
             dd = traj["terminals"][si : si + self.max_len]  # .reshape(-1)
         else:
@@ -89,12 +92,13 @@ class TransformSamplingSubTraj:
         ordering[ordering == -1] = ordering.max()
         timesteps[timesteps >= MAX_EPISODE_LEN] = MAX_EPISODE_LEN - 1  # padding cutoff
 
-        rtg = discount_cumsum(traj["rewards"][si:], gamma=1.0)[: tlen + 1].reshape(
+        rtg = discount_cumsum(traj["rewards"][si:], gamma=1.0)[: tlen+1 ].reshape(
             -1, 1
         )
+        #print("4", rtg.shape)
         if rtg.shape[0] <= tlen:
             rtg = np.concatenate([rtg, np.zeros((1, 1))])
-
+        #print(rtg.shape)
         # padding and state + reward normalization
         act_len = aa.shape[0]
         if tlen != act_len:
@@ -105,11 +109,13 @@ class TransformSamplingSubTraj:
 
         aa = np.concatenate([np.zeros((self.max_len - tlen, self.act_dim)), aa])
         rr = np.concatenate([np.zeros((self.max_len - tlen, 1)), rr])
+        rr_p = np.concatenate([np.zeros((self.max_len - tlen, 1)), rr_p])
         dd = np.concatenate([np.ones((self.max_len - tlen)) * 2, dd])
         rtg = (
             np.concatenate([np.zeros((self.max_len - tlen, 1)), rtg])
             * self.reward_scale
         )
+
         timesteps = np.concatenate([np.zeros((self.max_len - tlen)), timesteps])
         ordering = np.concatenate([np.zeros((self.max_len - tlen)), ordering])
         padding_mask = np.concatenate([np.zeros(self.max_len - tlen), np.ones(tlen)])
@@ -117,13 +123,15 @@ class TransformSamplingSubTraj:
         ss = torch.from_numpy(ss).to(dtype=torch.float32)
         aa = torch.from_numpy(aa).to(dtype=torch.float32).clamp(*self.action_range)
         rr = torch.from_numpy(rr).to(dtype=torch.float32)
+        rr_p = torch.from_numpy(rr_p).to(dtype=torch.float32)
         dd = torch.from_numpy(dd).to(dtype=torch.long)
         rtg = torch.from_numpy(rtg).to(dtype=torch.float32)
+        #rtg_p = torch.from_numpy(rtg_p).to(dtype=torch.float32)
         timesteps = torch.from_numpy(timesteps).to(dtype=torch.long)
         ordering = torch.from_numpy(ordering).to(dtype=torch.long)
         padding_mask = torch.from_numpy(padding_mask)
 
-        return ss, aa, rr, dd, rtg, timesteps, ordering, padding_mask
+        return ss, aa, rr, dd, rtg ,rr_p,  timesteps, ordering, padding_mask
 
 
 def create_dataloader(
@@ -180,3 +188,4 @@ def sample_trajs(trajectories, sample_size):
         p=p_sample,
     )
     return inds
+
