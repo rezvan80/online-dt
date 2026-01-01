@@ -57,6 +57,7 @@ class SequenceTrainer:
             states,
             actions,
             rewards,
+            target_return,
             dones,
             rtg,
             timesteps,
@@ -88,6 +89,8 @@ class SequenceTrainer:
         loss, nll, entropy = loss_fn(
             action_preds,  # a_hat_dist
             action_target,
+            rtg,
+            target_return,
             padding_mask,
             self.model.temperature().detach(),  # no gradient taken here
         )
@@ -111,3 +114,4 @@ class SequenceTrainer:
             nll.detach().cpu().item(),
             entropy.detach().cpu().item(),
         )
+
