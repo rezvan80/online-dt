@@ -69,12 +69,14 @@ class TransformSamplingSubTraj:
         self.action_range = action_range
 
     def __call__(self, traj):
+        #print(traj)
         si = random.randint(0, traj["rewards"].shape[0] - 1)
 
         # get sequences from dataset
         ss = traj["observations"][si : si + self.max_len].reshape(-1, self.state_dim)
         aa = traj["actions"][si : si + self.max_len].reshape(-1, self.act_dim)
         rr = traj["rewards"][si : si + self.max_len].reshape(-1, 1)
+       
         if "terminals" in traj:
             dd = traj["terminals"][si : si + self.max_len]  # .reshape(-1)
         else:
@@ -94,6 +96,11 @@ class TransformSamplingSubTraj:
         )
         if rtg.shape[0] <= tlen:
             rtg = np.concatenate([rtg, np.zeros((1, 1))])
+        rtg_p = discount_cumsum(traj["target_return"][si:], gamma=1.0)[: tlen + 1].reshape(
+            -1, 1
+        )
+        if rtg_p.shape[0] <= tlen:
+            rtg_p = np.concatenate([rtg_p, np.zeros((1, 1))])
 
         # padding and state + reward normalization
         act_len = aa.shape[0]
@@ -119,11 +126,12 @@ class TransformSamplingSubTraj:
         rr = torch.from_numpy(rr).to(dtype=torch.float32)
         dd = torch.from_numpy(dd).to(dtype=torch.long)
         rtg = torch.from_numpy(rtg).to(dtype=torch.float32)
+        rtg_p = torch.from_numpy(rtg_p).to(dtype=torch.float32)
         timesteps = torch.from_numpy(timesteps).to(dtype=torch.long)
         ordering = torch.from_numpy(ordering).to(dtype=torch.long)
         padding_mask = torch.from_numpy(padding_mask)
 
-        return ss, aa, rr, dd, rtg, timesteps, ordering, padding_mask
+        return ss, aa, rr, dd, rtg, rtg_p ,  timesteps, ordering, padding_mask
 
 
 def create_dataloader(
