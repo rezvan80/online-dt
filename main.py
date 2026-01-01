@@ -5,513 +5,207 @@ This source code is licensed under the CC BY-NC license found in the
 LICENSE.md file in the root directory of this source tree.
 """
 
-from torch.utils.tensorboard import SummaryWriter
-import argparse
-import pickle
-import random
-import time
-import gym
-import d4rl
-import torch
 import numpy as np
-
-import utils
-from replay_buffer import ReplayBuffer
-from lamb import Lamb
-from stable_baselines3.common.vec_env import SubprocVecEnv
-from pathlib import Path
-from data import create_dataloader
-from decision_transformer.models.decision_transformer import DecisionTransformer
-from evaluation import create_vec_eval_episodes_fn, vec_evaluate_episode_rtg
-from trainer import SequenceTrainer
-from logger import Logger
+import torch
 
 MAX_EPISODE_LEN = 1000
 
 
-class Experiment:
-    def __init__(self, variant):
-
-        self.state_dim, self.act_dim, self.action_range = self._get_env_spec(variant)
-        self.offline_trajs, self.state_mean, self.state_std = self._load_dataset(
-            variant["env"]
-        )
-        # initialize by offline trajs
-        self.replay_buffer = ReplayBuffer(variant["replay_size"], self.offline_trajs)
-
-        self.aug_trajs = []
-
-        self.device = variant.get("device", "cuda")
-        self.target_entropy = -self.act_dim
-        self.model = DecisionTransformer(
-            state_dim=self.state_dim,
-            act_dim=self.act_dim,
-            action_range=self.action_range,
-            max_length=variant["K"],
-            eval_context_length=variant["eval_context_length"],
+def create_vec_eval_episodes_fn(
+    vec_env,
+    eval_rtg,
+    state_dim,
+    act_dim,
+    state_mean,
+    state_std,
+    device,
+    use_mean=False,
+    reward_scale=0.001,
+):
+    def eval_episodes_fn(model):
+        target_return = [eval_rtg * reward_scale] * vec_env.num_envs
+        returns, lengths, _ = vec_evaluate_episode_rtg(
+            vec_env,
+            state_dim,
+            act_dim,
+            model,
             max_ep_len=MAX_EPISODE_LEN,
-            hidden_size=variant["embed_dim"],
-            n_layer=variant["n_layer"],
-            n_head=variant["n_head"],
-            n_inner=4 * variant["embed_dim"],
-            activation_function=variant["activation_function"],
-            n_positions=1024,
-            resid_pdrop=variant["dropout"],
-            attn_pdrop=variant["dropout"],
-            stochastic_policy=True,
-            ordering=variant["ordering"],
-            init_temperature=variant["init_temperature"],
-            target_entropy=self.target_entropy,
-        ).to(device=self.device)
-
-        self.optimizer = Lamb(
-            self.model.parameters(),
-            lr=variant["learning_rate"],
-            weight_decay=variant["weight_decay"],
-            eps=1e-8,
+            reward_scale=reward_scale,
+            target_return=target_return,
+            mode="normal",
+            state_mean=state_mean,
+            state_std=state_std,
+            device=device,
+            use_mean=use_mean,
         )
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(
-            self.optimizer, lambda steps: min((steps + 1) / variant["warmup_steps"], 1)
-        )
-
-        self.log_temperature_optimizer = torch.optim.Adam(
-            [self.model.log_temperature],
-            lr=1e-4,
-            betas=[0.9, 0.999],
-        )
-
-        # track the training progress and
-        # training/evaluation/online performance in all the iterations
-        self.pretrain_iter = 0
-        self.online_iter = 0
-        self.total_transitions_sampled = 0
-        self.variant = variant
-        self.reward_scale = 1.0 if "antmaze" in variant["env"] else 0.001
-        self.logger = Logger(variant)
-
-    def _get_env_spec(self, variant):
-        env = gym.make(variant["env"])
-        state_dim = env.observation_space.shape[0]
-        act_dim = env.action_space.shape[0]
-        action_range = [
-            float(env.action_space.low.min()) + 1e-6,
-            float(env.action_space.high.max()) - 1e-6,
-        ]
-        env.close()
-        return state_dim, act_dim, action_range
-
-    def _save_model(self, path_prefix, is_pretrain_model=False):
-        to_save = {
-            "model_state_dict": self.model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "pretrain_iter": self.pretrain_iter,
-            "online_iter": self.online_iter,
-            "args": self.variant,
-            "total_transitions_sampled": self.total_transitions_sampled,
-            "np": np.random.get_state(),
-            "python": random.getstate(),
-            "pytorch": torch.get_rng_state(),
-            "log_temperature_optimizer_state_dict": self.log_temperature_optimizer.state_dict(),
-        }
-
-        with open(f"{path_prefix}/model.pt", "wb") as f:
-            torch.save(to_save, f)
-        print(f"\nModel saved at {path_prefix}/model.pt")
-
-        if is_pretrain_model:
-            with open(f"{path_prefix}/pretrain_model.pt", "wb") as f:
-                torch.save(to_save, f)
-            print(f"Model saved at {path_prefix}/pretrain_model.pt")
-
-    def _load_model(self, path_prefix):
-        if Path(f"{path_prefix}/model.pt").exists():
-            with open(f"{path_prefix}/model.pt", "rb") as f:
-                checkpoint = torch.load(f)
-            self.model.load_state_dict(checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
-            self.log_temperature_optimizer.load_state_dict(
-                checkpoint["log_temperature_optimizer_state_dict"]
-            )
-            self.pretrain_iter = checkpoint["pretrain_iter"]
-            self.online_iter = checkpoint["online_iter"]
-            self.total_transitions_sampled = checkpoint["total_transitions_sampled"]
-            np.random.set_state(checkpoint["np"])
-            random.setstate(checkpoint["python"])
-            torch.set_rng_state(checkpoint["pytorch"])
-            print(f"Model loaded at {path_prefix}/model.pt")
-
-    def _load_dataset(self, env_name):
-
-        dataset_path = f"./data/{env_name}.pkl"
-        with open(dataset_path, "rb") as f:
-            trajectories = pickle.load(f)
-
-        states, traj_lens, returns = [], [], []
-        for path in trajectories:
-            states.append(path["observations"])
-            traj_lens.append(len(path["observations"]))
-            returns.append(path["rewards"].sum())
-        traj_lens, returns = np.array(traj_lens), np.array(returns)
-
-        # used for input normalization
-        states = np.concatenate(states, axis=0)
-        state_mean, state_std = np.mean(states, axis=0), np.std(states, axis=0) + 1e-6
-        num_timesteps = sum(traj_lens)
-
-        print("=" * 50)
-        print(f"Starting new experiment: {env_name}")
-        print(f"{len(traj_lens)} trajectories, {num_timesteps} timesteps found")
-        print(f"Average return: {np.mean(returns):.2f}, std: {np.std(returns):.2f}")
-        print(f"Max return: {np.max(returns):.2f}, min: {np.min(returns):.2f}")
-        print(f"Average length: {np.mean(traj_lens):.2f}, std: {np.std(traj_lens):.2f}")
-        print(f"Max length: {np.max(traj_lens):.2f}, min: {np.min(traj_lens):.2f}")
-        print("=" * 50)
-
-        sorted_inds = np.argsort(returns)  # lowest to highest
-        num_trajectories = 1
-        timesteps = traj_lens[sorted_inds[-1]]
-        ind = len(trajectories) - 2
-        while ind >= 0 and timesteps + traj_lens[sorted_inds[ind]] < num_timesteps:
-            timesteps += traj_lens[sorted_inds[ind]]
-            num_trajectories += 1
-            ind -= 1
-        sorted_inds = sorted_inds[-num_trajectories:]
-        trajectories = [trajectories[ii] for ii in sorted_inds]
-
-        return trajectories, state_mean, state_std
-
-    def _augment_trajectories(
-        self,
-        online_envs,
-        target_explore,
-        n,
-        randomized=False,
-    ):
-
-        max_ep_len = MAX_EPISODE_LEN
-
-        with torch.no_grad():
-            # generate init state
-            target_return = [target_explore * self.reward_scale] * online_envs.num_envs
-
-            returns, lengths, trajs = vec_evaluate_episode_rtg(
-                online_envs,
-                self.state_dim,
-                self.act_dim,
-                self.model,
-                max_ep_len=max_ep_len,
-                reward_scale=self.reward_scale,
-                target_return=target_return,
-                mode="normal",
-                state_mean=self.state_mean,
-                state_std=self.state_std,
-                device=self.device,
-                use_mean=False,
-            )
-
-        self.replay_buffer.add_new_trajs(trajs)
-        self.aug_trajs += trajs
-        self.total_transitions_sampled += np.sum(lengths)
-
+        suffix = "_gm" if use_mean else ""
         return {
-            "aug_traj/return": np.mean(returns),
-            "aug_traj/length": np.mean(lengths),
+            f"evaluation/return_mean{suffix}": np.mean(returns),
+            f"evaluation/return_std{suffix}": np.std(returns),
+            f"evaluation/length_mean{suffix}": np.mean(lengths),
+            f"evaluation/length_std{suffix}": np.std(lengths),
         }
 
-    def pretrain(self, eval_envs, loss_fn):
-        print("\n\n\n*** Pretrain ***")
+    return eval_episodes_fn
 
-        eval_fns = [
-            create_vec_eval_episodes_fn(
-                vec_env=eval_envs,
-                eval_rtg=self.variant["eval_rtg"],
-                state_dim=self.state_dim,
-                act_dim=self.act_dim,
-                state_mean=self.state_mean,
-                state_std=self.state_std,
-                device=self.device,
-                use_mean=True,
-                reward_scale=self.reward_scale,
-            )
-        ]
 
-        trainer = SequenceTrainer(
-            model=self.model,
-            optimizer=self.optimizer,
-            log_temperature_optimizer=self.log_temperature_optimizer,
-            scheduler=self.scheduler,
-            device=self.device,
-        )
+@torch.no_grad()
+def vec_evaluate_episode_rtg(
+    vec_env,
+    state_dim,
+    act_dim,
+    model,
+    target_return: list,
+    max_ep_len=1000,
+    reward_scale=0.001,
+    state_mean=0.0,
+    state_std=1.0,
+    device="cuda",
+    mode="normal",
+    use_mean=False,
+):
+    assert len(target_return) == vec_env.num_envs
 
-        writer = (
-            SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
-        )
-        while self.pretrain_iter < self.variant["max_pretrain_iters"]:
-            # in every iteration, prepare the data loader
-            dataloader = create_dataloader(
-                trajectories=self.offline_trajs,
-                num_iters=self.variant["num_updates_per_pretrain_iter"],
-                batch_size=self.variant["batch_size"],
-                max_len=self.variant["K"],
-                state_dim=self.state_dim,
-                act_dim=self.act_dim,
-                state_mean=self.state_mean,
-                state_std=self.state_std,
-                reward_scale=self.reward_scale,
-                action_range=self.action_range,
-            )
+    model.eval()
+    model.to(device=device)
 
-            train_outputs = trainer.train_iteration(
-                loss_fn=loss_fn,
-                dataloader=dataloader,
-            )
-            eval_outputs, eval_reward = self.evaluate(eval_fns)
-            outputs = {"time/total": time.time() - self.start_time}
-            outputs.update(train_outputs)
-            outputs.update(eval_outputs)
-            self.logger.log_metrics(
-                outputs,
-                iter_num=self.pretrain_iter,
-                total_transitions_sampled=self.total_transitions_sampled,
-                writer=writer,
-            )
+    state_mean = torch.from_numpy(state_mean).to(device=device)
+    state_std = torch.from_numpy(state_std).to(device=device)
 
-            self._save_model(
-                path_prefix=self.logger.log_path,
-                is_pretrain_model=True,
-            )
+    num_envs = vec_env.num_envs
+    state = vec_env.reset()
 
-            self.pretrain_iter += 1
+    # we keep all the histories on the device
+    # note that the latest action and reward will be "padding"
+    states = (
+        torch.from_numpy(state)
+        .reshape(num_envs, state_dim)
+        .to(device=device, dtype=torch.float32)
+    ).reshape(num_envs, -1, state_dim)
+    actions = torch.zeros(0, device=device, dtype=torch.float32)
+    rewards = torch.zeros(0, device=device, dtype=torch.float32)
+    reward_preds = torch.zeros(0, device=device, dtype=torch.float32)
 
-    def evaluate(self, eval_fns):
-        eval_start = time.time()
-        self.model.eval()
-        outputs = {}
-        for eval_fn in eval_fns:
-            o = eval_fn(self.model)
-            outputs.update(o)
-        outputs["time/evaluation"] = time.time() - eval_start
+    ep_return = target_return
+    target_return = torch.tensor(ep_return, device=device, dtype=torch.float32).reshape(
+        num_envs, -1, 1
+    )
+    timesteps = torch.tensor([0] * num_envs, device=device, dtype=torch.long).reshape(
+        num_envs, -1
+    )
 
-        eval_reward = outputs["evaluation/return_mean_gm"]
-        return outputs, eval_reward
+    # episode_return, episode_length = 0.0, 0
+    episode_return = np.zeros((num_envs, 1)).astype(float)
+    episode_length = np.full(num_envs, np.inf)
 
-    def online_tuning(self, online_envs, eval_envs, loss_fn):
-
-        print("\n\n\n*** Online Finetuning ***")
-
-        trainer = SequenceTrainer(
-            model=self.model,
-            optimizer=self.optimizer,
-            log_temperature_optimizer=self.log_temperature_optimizer,
-            scheduler=self.scheduler,
-            device=self.device,
-        )
-        eval_fns = [
-            create_vec_eval_episodes_fn(
-                vec_env=eval_envs,
-                eval_rtg=self.variant["eval_rtg"],
-                state_dim=self.state_dim,
-                act_dim=self.act_dim,
-                state_mean=self.state_mean,
-                state_std=self.state_std,
-                device=self.device,
-                use_mean=True,
-                reward_scale=self.reward_scale,
-            )
-        ]
-        writer = (
-            SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
-        )
-        while self.online_iter < self.variant["max_online_iters"]:
-
-            outputs = {}
-            augment_outputs = self._augment_trajectories(
-                online_envs,
-                self.variant["online_rtg"],
-                n=self.variant["num_online_rollouts"],
-            )
-            outputs.update(augment_outputs)
-
-            dataloader = create_dataloader(
-                trajectories=self.replay_buffer.trajectories,
-                num_iters=self.variant["num_updates_per_online_iter"],
-                batch_size=self.variant["batch_size"],
-                max_len=self.variant["K"],
-                state_dim=self.state_dim,
-                act_dim=self.act_dim,
-                state_mean=self.state_mean,
-                state_std=self.state_std,
-                reward_scale=self.reward_scale,
-                action_range=self.action_range,
-            )
-
-            # finetuning
-            is_last_iter = self.online_iter == self.variant["max_online_iters"] - 1
-            if (self.online_iter + 1) % self.variant[
-                "eval_interval"
-            ] == 0 or is_last_iter:
-                evaluation = True
-            else:
-                evaluation = False
-
-            train_outputs = trainer.train_iteration(
-                loss_fn=loss_fn,
-                dataloader=dataloader,
-            )
-            outputs.update(train_outputs)
-
-            if evaluation:
-                eval_outputs, eval_reward = self.evaluate(eval_fns)
-                outputs.update(eval_outputs)
-
-            outputs["time/total"] = time.time() - self.start_time
-
-            # log the metrics
-            self.logger.log_metrics(
-                outputs,
-                iter_num=self.pretrain_iter + self.online_iter,
-                total_transitions_sampled=self.total_transitions_sampled,
-                writer=writer,
-            )
-
-            self._save_model(
-                path_prefix=self.logger.log_path,
-                is_pretrain_model=False,
-            )
-
-            self.online_iter += 1
-
-    def __call__(self):
-
-        utils.set_seed_everywhere(args.seed)
-
-        import d4rl
-
-        def loss_fn(
-            a_hat_dist,
-            a,
-            attention_mask,
-            entropy_reg,
-        ):
-            # a_hat is a SquashedNormal Distribution
-            log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
-
-            entropy = a_hat_dist.entropy().mean()
-            loss = -(log_likelihood + entropy_reg * entropy)
-
-            return (
-                loss,
-                -log_likelihood,
-                entropy,
-            )
-
-        def get_env_builder(seed, env_name, target_goal=None):
-            def make_env_fn():
-                import d4rl
-
-                env = gym.make(env_name)
-                env.seed(seed)
-                if hasattr(env.env, "wrapped_env"):
-                    env.env.wrapped_env.seed(seed)
-                elif hasattr(env.env, "seed"):
-                    env.env.seed(seed)
-                else:
-                    pass
-                env.action_space.seed(seed)
-                env.observation_space.seed(seed)
-
-                if target_goal:
-                    env.set_target_goal(target_goal)
-                    print(f"Set the target goal to be {env.target_goal}")
-                return env
-
-            return make_env_fn
-
-        print("\n\nMaking Eval Env.....")
-        env_name = self.variant["env"]
-        if "antmaze" in env_name:
-            env = gym.make(env_name)
-            target_goal = env.target_goal
-            env.close()
-            print(f"Generated the fixed target goal: {target_goal}")
-        else:
-            target_goal = None
-        eval_envs = SubprocVecEnv(
+    unfinished = np.ones(num_envs).astype(bool)
+    for t in range(max_ep_len):
+        # add padding
+        actions = torch.cat(
             [
-                get_env_builder(i, env_name=env_name, target_goal=target_goal)
-                for i in range(self.variant["num_eval_episodes"])
-            ]
+                actions,
+                torch.zeros((num_envs, act_dim), device=device).reshape(
+                    num_envs, -1, act_dim
+                ),
+            ],
+            dim=1,
+        )
+        rewards = torch.cat(
+            [
+                rewards,
+                torch.zeros((num_envs, 1), device=device).reshape(num_envs, -1, 1),
+            ],
+            dim=1,
+        )
+        reward_preds = torch.cat(
+            [
+                reward_preds,
+                torch.zeros((num_envs, 1), device=device).reshape(num_envs, -1, 1),
+            ],
+            dim=1,
+        )
+        state_pred, action_dist, reward_pred = model.get_predictions(
+            (states.to(dtype=torch.float32) - state_mean) / state_std,
+            actions.to(dtype=torch.float32),
+            rewards.to(dtype=torch.float32),
+            target_return.to(dtype=torch.float32),
+            timesteps.to(dtype=torch.long),
+            num_envs=num_envs,
+        )
+        #reward_pred = torch.from_numpy(reward_pred).to(device=device).reshape(num_envs, 1)
+        reward_preds[:, -1] = reward_pred.to(device=device).reshape(num_envs, 1)
+        state_pred = state_pred.detach().cpu().numpy().reshape(num_envs, -1)
+        reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
+
+        # the return action is a SquashNormal distribution
+        action = action_dist.sample().reshape(num_envs, -1, act_dim)[:, -1]
+        if use_mean:
+            action = action_dist.mean.reshape(num_envs, -1, act_dim)[:, -1]
+        action = action.clamp(*model.action_range)
+
+        state, reward, done, _ = vec_env.step(action.detach().cpu().numpy())
+
+        # eval_env.step() will execute the action for all the sub-envs, for those where
+        # the episodes have terminated, the envs will be reset. Hence we use
+        # "unfinished" to track whether the first episode we roll out for each sub-env is
+        # finished. In contrast, "done" only relates to the current episode
+        episode_return[unfinished] += reward[unfinished].reshape(-1, 1)
+
+        actions[:, -1] = action
+        state = (
+            torch.from_numpy(state).to(device=device).reshape(num_envs, -1, state_dim)
+        )
+        states = torch.cat([states, state], dim=1)
+        reward = torch.from_numpy(reward).to(device=device).reshape(num_envs, 1)
+        rewards[:, -1] = reward
+
+        if mode != "delayed":
+            pred_return = target_return[:, -1] - (reward * reward_scale)
+        else:
+            pred_return = target_return[:, -1]
+        target_return = torch.cat(
+            [target_return, pred_return.reshape(num_envs, -1, 1)], dim=1
         )
 
-        self.start_time = time.time()
-        if self.variant["max_pretrain_iters"]:
-            self.pretrain(eval_envs, loss_fn)
+        timesteps = torch.cat(
+            [
+                timesteps,
+                torch.ones((num_envs, 1), device=device, dtype=torch.long).reshape(
+                    num_envs, 1
+                )
+                * (t + 1),
+            ],
+            dim=1,
+        )
 
-        if self.variant["max_online_iters"]:
-            print("\n\nMaking Online Env.....")
-            online_envs = SubprocVecEnv(
-                [
-                    get_env_builder(i + 100, env_name=env_name, target_goal=target_goal)
-                    for i in range(self.variant["num_online_rollouts"])
-                ]
-            )
-            self.online_tuning(online_envs, eval_envs, loss_fn)
-            online_envs.close()
+        if t == max_ep_len - 1:
+            done = np.ones(done.shape).astype(bool)
 
-        eval_envs.close()
+        if np.any(done):
+            ind = np.where(done)[0]
+            unfinished[ind] = False
+            episode_length[ind] = np.minimum(episode_length[ind], t + 1)
+
+        if not np.any(unfinished):
+            break
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=10)
-    parser.add_argument("--env", type=str, default="hopper-medium-v2")
+    trajectories = []
+    for ii in range(num_envs):
+        ep_len = episode_length[ii].astype(int)
+        terminals = np.zeros(ep_len)
+        terminals[-1] = 1
+        traj = {
+            "observations": states[ii].detach().cpu().numpy()[:ep_len],
+            "actions": actions[ii].detach().cpu().numpy()[:ep_len],
+            "rewards": rewards[ii].detach().cpu().numpy()[:ep_len],
+            "reward_pred": reward_preds[ii].detach().cpu().numpy()[:ep_len],
+            "terminals": terminals,
+        }
+        trajectories.append(traj)
 
-    # model options
-    parser.add_argument("--K", type=int, default=20)
-    parser.add_argument("--embed_dim", type=int, default=512)
-    parser.add_argument("--n_layer", type=int, default=4)
-    parser.add_argument("--n_head", type=int, default=4)
-    parser.add_argument("--activation_function", type=str, default="relu")
-    parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--eval_context_length", type=int, default=5)
-    # 0: no pos embedding others: absolute ordering
-    parser.add_argument("--ordering", type=int, default=0)
-
-    # shared evaluation options
-    parser.add_argument("--eval_rtg", type=int, default=3600)
-    parser.add_argument("--num_eval_episodes", type=int, default=10)
-
-    # shared training options
-    parser.add_argument("--init_temperature", type=float, default=0.1)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--learning_rate", "-lr", type=float, default=1e-4)
-    parser.add_argument("--weight_decay", "-wd", type=float, default=5e-4)
-    parser.add_argument("--warmup_steps", type=int, default=10000)
-
-    # pretraining options
-    parser.add_argument("--max_pretrain_iters", type=int, default=1)
-    parser.add_argument("--num_updates_per_pretrain_iter", type=int, default=5000)
-
-    # finetuning options
-    parser.add_argument("--max_online_iters", type=int, default=1500)
-    parser.add_argument("--online_rtg", type=int, default=7200)
-    parser.add_argument("--num_online_rollouts", type=int, default=1)
-    parser.add_argument("--replay_size", type=int, default=1000)
-    parser.add_argument("--num_updates_per_online_iter", type=int, default=300)
-    parser.add_argument("--eval_interval", type=int, default=10)
-
-    # environment options
-    parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--log_to_tb", "-w", type=bool, default=True)
-    parser.add_argument("--save_dir", type=str, default="./exp")
-    parser.add_argument("--exp_name", type=str, default="default")
-
-    args = parser.parse_args()
-
-    utils.set_seed_everywhere(args.seed)
-    experiment = Experiment(vars(args))
-
-    print("=" * 50)
-    experiment()
+    return (
+        episode_return.reshape(num_envs),
+        episode_length.reshape(num_envs),
+        trajectories,
+    )
