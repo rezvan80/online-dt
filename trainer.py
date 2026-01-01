@@ -59,6 +59,7 @@ class SequenceTrainer:
             rewards,
             dones,
             rtg,
+            reward_p,
             timesteps,
             ordering,
             padding_mask,
@@ -72,7 +73,7 @@ class SequenceTrainer:
         timesteps = timesteps.to(self.device)
         ordering = ordering.to(self.device)
         padding_mask = padding_mask.to(self.device)
-
+        print(rewards.shape)
         action_target = torch.clone(actions)
 
         _, action_preds, _ = self.model.forward(
@@ -88,6 +89,8 @@ class SequenceTrainer:
         loss, nll, entropy = loss_fn(
             action_preds,  # a_hat_dist
             action_target,
+            rtg[: , :-1],
+            reward_p,
             padding_mask,
             self.model.temperature().detach(),  # no gradient taken here
         )
