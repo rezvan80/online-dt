@@ -144,7 +144,7 @@ class Experiment:
 
     def _load_dataset(self, env_name):
 
-        dataset_path = f"./data/{env_name}.pkl"
+        dataset_path = f"data/{env_name}.pkl"
         with open(dataset_path, "rb") as f:
             trajectories = pickle.load(f)
 
@@ -392,14 +392,17 @@ class Experiment:
         def loss_fn(
             a_hat_dist,
             a,
+            r,
+            reward_pred,
             attention_mask,
             entropy_reg,
         ):
             # a_hat is a SquashedNormal Distribution
             log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
-
+            log_likelihood = a_hat_dist.log_likelihood(a)
+            print(log_likelihood2.shape)
             entropy = a_hat_dist.entropy().mean()
-            loss = -(log_likelihood + entropy_reg * entropy)
+            loss = -(log_likelihood*(r-reward_pred).mean()) + entropy_reg * entropy
 
             return (
                 loss,
@@ -446,8 +449,8 @@ class Experiment:
         )
 
         self.start_time = time.time()
-        if self.variant["max_pretrain_iters"]:
-            self.pretrain(eval_envs, loss_fn)
+        #if self.variant["max_pretrain_iters"]:
+            #self.pretrain(eval_envs, loss_fn)
 
         if self.variant["max_online_iters"]:
             print("\n\nMaking Online Env.....")
@@ -491,7 +494,7 @@ if __name__ == "__main__":
     parser.add_argument("--warmup_steps", type=int, default=10000)
 
     # pretraining options
-    parser.add_argument("--max_pretrain_iters", type=int, default=1)
+    parser.add_argument("--max_pretrain_iters", type=int, default=0)
     parser.add_argument("--num_updates_per_pretrain_iter", type=int, default=5000)
 
     # finetuning options
