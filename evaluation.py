@@ -84,6 +84,7 @@ def vec_evaluate_episode_rtg(
     ).reshape(num_envs, -1, state_dim)
     actions = torch.zeros(0, device=device, dtype=torch.float32)
     rewards = torch.zeros(0, device=device, dtype=torch.float32)
+    reward_preds = torch.zeros(0, device=device, dtype=torch.float32)
 
     ep_return = target_return
     target_return = torch.tensor(ep_return, device=device, dtype=torch.float32).reshape(
@@ -116,15 +117,22 @@ def vec_evaluate_episode_rtg(
             ],
             dim=1,
         )
-
+        reward_preds = torch.cat(
+            [
+                reward_preds,
+                torch.zeros((num_envs, 1), device=device).reshape(num_envs, -1, 1),
+            ],
+            dim=1,
+        )
         state_pred, action_dist, reward_pred = model.get_predictions(
-            (states.to(dtype=torch.float32) - state_mean) / state_std,
+            (states.to(dtype=torch.float32)),
             actions.to(dtype=torch.float32),
             rewards.to(dtype=torch.float32),
             target_return.to(dtype=torch.float32),
             timesteps.to(dtype=torch.long),
             num_envs=num_envs,
         )
+        reward_preds[:, -1] = reward_pred.to(device=device).reshape(num_envs, 1)
         state_pred = state_pred.detach().cpu().numpy().reshape(num_envs, -1)
         reward_pred = reward_pred.detach().cpu().numpy().reshape(num_envs)
 
@@ -135,7 +143,7 @@ def vec_evaluate_episode_rtg(
         action = action.clamp(*model.action_range)
 
         state, reward, done, _ = vec_env.step(action.detach().cpu().numpy())
-
+      
         # eval_env.step() will execute the action for all the sub-envs, for those where
         # the episodes have terminated, the envs will be reset. Hence we use
         # "unfinished" to track whether the first episode we roll out for each sub-env is
@@ -190,6 +198,8 @@ def vec_evaluate_episode_rtg(
             "observations": states[ii].detach().cpu().numpy()[:ep_len],
             "actions": actions[ii].detach().cpu().numpy()[:ep_len],
             "rewards": rewards[ii].detach().cpu().numpy()[:ep_len],
+            "reward_pred": reward_preds[ii].detach().cpu().numpy()[:ep_len],
+
             "terminals": terminals,
         }
         trajectories.append(traj)
