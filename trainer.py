@@ -57,9 +57,10 @@ class SequenceTrainer:
             states,
             actions,
             rewards,
-            target_return,
+            
             dones,
             rtg,
+            reward_p,
             timesteps,
             ordering,
             padding_mask,
@@ -68,6 +69,8 @@ class SequenceTrainer:
         states = states.to(self.device)
         actions = actions.to(self.device)
         rewards = rewards.to(self.device)
+        reward_p = reward_p.to(self.device)
+        
         dones = dones.to(self.device)
         rtg = rtg.to(self.device)
         timesteps = timesteps.to(self.device)
@@ -89,8 +92,8 @@ class SequenceTrainer:
         loss, nll, entropy = loss_fn(
             action_preds,  # a_hat_dist
             action_target,
-            rtg,
-            target_return,
+            rtg[: , :-1],
+            reward_p,
             padding_mask,
             self.model.temperature().detach(),  # no gradient taken here
         )
@@ -114,4 +117,5 @@ class SequenceTrainer:
             nll.detach().cpu().item(),
             entropy.detach().cpu().item(),
         )
+
 
