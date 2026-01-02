@@ -25,7 +25,7 @@ from decision_transformer.models.decision_transformer import DecisionTransformer
 from evaluation import create_vec_eval_episodes_fn, vec_evaluate_episode_rtg
 from trainer import SequenceTrainer
 from logger import Logger
-
+import torch.nn.functional as F
 MAX_EPISODE_LEN = 1000
 
 
@@ -37,7 +37,7 @@ class Experiment:
             variant["env"]
         )
         # initialize by offline trajs
-        self.replay_buffer = ReplayBuffer(variant["replay_size"], self.offline_trajs)
+        self.replay_buffer = ReplayBuffer(variant["replay_size"])
 
         self.aug_trajs = []
 
@@ -324,6 +324,12 @@ class Experiment:
         writer = (
             SummaryWriter(self.logger.log_path) if self.variant["log_to_tb"] else None
         )
+        for i in range(1000):
+          augment_outputs = self._augment_trajectories(
+                online_envs,
+                self.variant["online_rtg"],
+                n=self.variant["num_online_rollouts"],
+            )
         while self.online_iter < self.variant["max_online_iters"]:
 
             outputs = {}
@@ -397,16 +403,19 @@ class Experiment:
             attention_mask,
             entropy_reg,
         ):
+            
             # a_hat is a SquashedNormal Distribution
             log_likelihood = a_hat_dist.log_likelihood(a)[attention_mask > 0].mean()
             log_likelihood = a_hat_dist.log_likelihood(a)
-            print(log_likelihood2.shape)
+            log_likelihood2=log_likelihood.mean()
             entropy = a_hat_dist.entropy().mean()
-            loss = -(log_likelihood*(r-reward_pred).mean()) + entropy_reg * entropy
-
+            #print(log_likelihood.shape, r.shape, reward_pred.shape, entropy.shape)
+            #print(reward_pred[0] , r[0])
+            loss = -((log_likelihood*((r*10).squeeze().detach()-reward_pred.squeeze().detach())).mean()) 
+            loss2=F.mse_loss(reward_pred, (r*10).detach())
             return (
-                loss,
-                -log_likelihood,
+                loss+loss2,
+                -log_likelihood2,
                 entropy,
             )
 
